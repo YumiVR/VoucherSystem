@@ -1,0 +1,96 @@
+# Cryptography
+
+All cryptography runs in the Electron main process using Node.js `crypto`. The renderer never sees private keys or decrypted payloads.
+
+## Primitives
+
+| Purpose | Algorithm |
+| --- | --- |
+| Key pairs (each computer) | RSA-3072, public exponent 65537. Public keys are exchanged as SPKI DER (base64url); private keys as PKCS#8 DER, stored encrypted by OS secure storage |
+| Wrapping a temporary AES key | RSA-OAEP, SHA-256 |
+| Encrypting setup and voucher payloads | AES-256-GCM, random 96-bit IV, 128-bit tag, header bound as AAD |
+| Signatures | RSA-PSS, SHA-256, 32-byte salt |
+| Checksums (setup parts) | SHA-256 |
+| Administrator password | scrypt N=32768, r=8, p=1, 16-byte salt, 32-byte output |
+| Backup key | scrypt N=32768, r=8, p=1 from the backup password |
+| Randomness | `crypto.randomBytes`, `randomUUID` (v4), `randomInt` (no modulo bias) |
+
+Public keys received over a barcode are accepted only if they are RSA-3072 with exponent 65537.
+
+## Canonical JSON
+
+Signed JSON is serialised canonically (`src/shared/utilities/canonicalJson.ts`): object keys sorted by code unit order, no whitespace, `undefined` and non-finite numbers rejected. The same function is used by signer and verifier, so signatures do not depend on property order.
+
+## Envelope
+
+Descriptive model (validated by `envelopeSchema`):
+
+```json
+{
+  "format": "voucher-redeem-envelope",
+  "version": 1,
+  "type": "setup-response | voucher",
+  "keyId": "16 hex characters (SHA-256 of recipient SPKI, truncated)",
+  "wrappedKey": "base64url",
+  "iv": "base64url",
+  "ciphertext": "base64url",
+  "authTag": "base64url",
+  "signature": "base64url (setup-response only)"
+}
+```
+
+Wire format used in barcodes (`src/main/crypto/envelope.ts`), big-endian, so a voucher fits one PDF417:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 2 | Magic `VR` |
+| 2 | 1 | Version (1) |
+| 3 | 1 | Type (1 setup-response, 2 voucher) |
+| 4 | 1 | Flags (bit 0 deflate-compressed, bit 1 signature present; other bits rejected) |
+| 5 | 8 | Key ID |
+| 13 | 384 | RSA-OAEP wrapped AES key |
+| 397 | 12 | IV |
+| 409 | 16 | GCM tag |
+| 425 | 384 | Signature (only if flag set) |
+| next | n | Ciphertext |
+
+The first 13 bytes are the AES-GCM additional authenticated data, so changing the type, version, flags or key ID invalidates the tag.
+
+## Hybrid encryption
+
+1. Generate a random 256-bit AES key and 96-bit IV.
+2. Encrypt the plaintext with AES-256-GCM (header as AAD).
+3. Wrap the AES key with the recipient public key (RSA-OAEP, SHA-256).
+4. Zero the AES key in memory after use.
+
+Decryption checks the key ID, unwraps the key, then authenticates and decrypts. Any modification (ciphertext, tag, IV, wrapped key, header) fails authentication.
+
+## Pairing
+
+1. **Issuer request** (text PDF417): `issuer-pairing-request` with `pairingSessionId` (UUID v4), Issuer public key and `createdAt`. No secrets.
+2. **Redeemer setup**: `redeemer-setup` JSON (session ID, Redeemer public key, identifier, 366 rolling codes, `createdAt`) is canonicalised, deflate-compressed, encrypted for the Issuer public key and signed by the Redeemer private key over `header || wrappedKey || iv || tag || ciphertext`.
+3. **Multi-part transfer**: the wire blob is base64url encoded and divided evenly into the fewest parts of at most 700 characters. Each part carries `pairingSessionId`, `partNumber`, `totalParts`, SHA-256 of the whole blob and SHA-256 of its own chunk.
+4. **Issuer reassembly**: parts are accepted in any order; duplicates, altered chunks (checksum mismatch), mixed sessions and inconsistent totals are rejected. After all parts arrive the full-payload checksum is verified, the blob is decrypted with the Issuer private key, the session ID is matched, and the Redeemer signature is verified using the key inside the payload.
+
+## Voucher
+
+1. Build the payload (`voucherPayloadSchema`: strict, UUID v4 voucher ID, integer pence, GBP, rolling word, local date/time, timestamp with UTC offset, installation identifier).
+2. Sign `canonicalJson(payload)` with the Issuer private key (RSA-PSS SHA-256).
+3. Encode the payload compactly: version, UUID (16 bytes), amount (u32), epoch milliseconds (u48), UTC offset minutes (i16), identifier, rolling word, name. Date, time and timestamp strings are re-derived on decode, so the signed JSON is reproduced exactly.
+4. Encrypt `payload || signature` for the Redeemer public key. The envelope (about 860 bytes) is printed as one PDF417 whose content is its decimal-digit form (`0x01 || envelope` as a big integer), so a keyboard-wedge scanner can type it without control characters.
+
+Redemption reverses this and then applies, in order: installation identifier, rolling code for the creation date, future-date check (5-minute tolerance), global expiry, duplicate check, and finally the transactional insert.
+
+## Rolling date code
+
+A map from `DD-MM` (all 366 valid dates including `29-02`, no year) to a word, generated by the Redeemer. The Issuer embeds the word for the creation date; the Redeemer compares it with its own map for the date in the voucher. It confirms the date mapping and is not a cryptographic protection.
+
+## Backups
+
+`VRBK` magic, version, scrypt parameter, 16-byte salt, 12-byte IV, 16-byte tag, then AES-256-GCM ciphertext of `gzip(JSON)`. The JSON holds settings (secrets in decrypted form, protected only by the backup encryption), redemptions and audit rows plus a SHA-256 checksum of the body. Secrets are re-protected with the destination computer's secure storage on restore.
+
+## Limits
+
+- The three-letter installation identifier has about 17,576 values and is not a secret.
+- Authenticated encryption protects each barcode, not the system clock or the redemption database.
+- A holder of a genuine voucher can present it; duplicate protection depends on the Redeemer's local database.
